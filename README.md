@@ -59,42 +59,44 @@ The server doesn't care about your note-taking app — it just needs markdown fi
 
 ## Permission System
 
-Control agent access by adding `agent_access` to any note's frontmatter:
-
-```yaml
----
-agent_access: edit    # Agent can freely edit
-agent_access: append  # Agent can only add content (safe default)
-agent_access: read    # Agent can view but not modify
-agent_access: hidden  # Completely invisible to agents
----
-```
-
-**Notes without frontmatter default to `append`.** No configuration files. No hardcoded lists. Just frontmatter.
+Control agent access with a single frontmatter field. **Notes without frontmatter default to `append`** — no configuration files, no hardcoded lists.
 
 ### Permission Hierarchy
 
-| Value    | Agent can…                                               |
-| -------- | -------------------------------------------------------- |
-| `hidden` | Nothing — file is completely invisible                   |
-| `read`   | View but not modify                                      |
-| `append` | Add content only (default for notes without frontmatter) |
-| `edit`   | Freely edit                                              |
+| Value    | Agent can…                                     |
+| -------- | ---------------------------------------------- |
+| `hidden` | Nothing — file is completely invisible         |
+| `read`   | View but not modify                            |
+| `append` | Add content only _(default if no frontmatter)_ |
+| `edit`   | Full read + write access                       |
 
-### Tool Permission Requirements
+### Usage
 
-| Tool                                     | Required `agent_access`                        |
-| ---------------------------------------- | ---------------------------------------------- |
-| `get_note`, `search_notes`, `list_notes` | `read` or higher (invisible if `hidden`)       |
-| `append_to_note`                         | `append` or higher (default if no frontmatter) |
-| `update_note`                            | `edit`                                         |
-| `replace_in_note`                        | `edit`                                         |
-| `update_section`                         | `edit`                                         |
+Add `agent_access` to any note's frontmatter:
 
-If a note lacks the required permission, edit tools return:
+```yaml
+---
+agent_access: edit # or: append, read, hidden
+---
+```
+
+### Tool Requirements
+
+| Tools            | Minimum Permission |
+| ---------------- | ------------------ |
+| Read operations  | `read`             |
+| `append_to_note` | `append`           |
+| Edit operations  | `edit`             |
+
+**Read operations:** `get_note`, `search_notes`, `list_notes`
+**Edit operations:** `update_note`, `replace_in_note`, `update_section`
+
+Notes with insufficient permissions return a clear error:
 
 ```
-Error: Insufficient permissions. This note has agent_access: 'append', but this operation requires: 'edit'. Add agent_access: 'edit' to the note's frontmatter to enable this operation.
+Error: Insufficient permissions. This note has agent_access: 'append',
+but this operation requires: 'edit'. Add agent_access: 'edit' to the
+note's frontmatter to enable this operation.
 ```
 
 ---
