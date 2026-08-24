@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sys
+import traceback
 from typing import Any
 
 import mcp.server.stdio
@@ -11,6 +14,7 @@ from dotenv import load_dotenv
 from mcp.server import Server
 
 from .vault import (
+    NoteReadError,
     append_to_note,
     create_note_from_template,
     get_note,
@@ -26,6 +30,20 @@ from .vault import (
 load_dotenv()
 
 app = Server("markdown-vault")
+
+# Shared tail for every tool that scans the vault and may skip files.
+WARNINGS_NOTE = (
+    "If any files had to be skipped because they are unreadable or their YAML "
+    "frontmatter is malformed, a 'warnings' array lists each skipped path and its "
+    "error — surface those to the user, since the notes are missing from the "
+    "results. The key is absent entirely when nothing was skipped."
+)
+
+
+def _reply(payload: Any) -> list[types.TextContent]:
+    """Serialize a tool result. default=str keeps YAML dates/times serializable."""
+    text = json.dumps(payload, indent=2, default=str)
+    return [types.TextContent(type="text", text=text)]
 
 
 def _vault_path() -> str:
@@ -43,7 +61,11 @@ async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="search_notes",
-            description="Search markdown notes by content or title (case-insensitive). Returns up to 10 matches with a short excerpt around each match.",
+            description=(
+                "Search markdown notes by content or title (case-insensitive). "
+                "Returns {'results': [...]} with up to 10 matches, each with a short "
+                "excerpt around the match. " + WARNINGS_NOTE
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -57,7 +79,11 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_note",
-            description="Retrieve the full content and metadata of a specific note by its path relative to the vault root.",
+            description=(
+                "Retrieve the full content and metadata of a specific note by its path "
+                "relative to the vault root. If the note's frontmatter cannot be parsed, "
+                "returns {'error', 'detail', 'path'} describing the problem instead."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -71,7 +97,10 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="list_notes",
-            description="List all markdown notes in the vault, optionally filtered to a specific subfolder.",
+            description=(
+                "List all markdown notes in the vault, optionally filtered to a specific "
+                "subfolder. Returns {'notes': [...]}. " + WARNINGS_NOTE
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -88,7 +117,8 @@ async def handle_list_tools() -> list[types.Tool]:
             description=(
                 "Show all notes that agents can append to — those with agent_access: 'append' or 'edit' "
                 "in their frontmatter, plus notes with no frontmatter (default access is 'append'). "
-                "Use this before append_to_note to confirm a note is writable."
+                "Use this before append_to_note to confirm a note is writable. "
+                "Returns {'writable_notes': [...]}. " + WARNINGS_NOTE
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -123,7 +153,8 @@ async def handle_list_tools() -> list[types.Tool]:
             name="list_templates",
             description=(
                 "List all available templates in the vault's templates/ directory. "
-                "Use this before create_note_from_template to see what templates exist."
+                "Use this before create_note_from_template to see what templates exist. "
+                "Returns {'templates': [...]}. " + WARNINGS_NOTE
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -252,27 +283,23 @@ async def handle_call_tool(
             if not query:
                 raise ValueError("'query' argument is required")
             results = search_notes(vault, query)
-            import json
-            return [types.TextContent(type="text", text=json.dumps(results, indent=2))]
+            return _reply(results)
 
         elif name == "get_note":
             note_path = arguments.get("note_path", "")
             if not note_path:
                 raise ValueError("'note_path' argument is required")
             result = get_note(vault, note_path)
-            import json
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "list_notes":
             folder = arguments.get("folder")
             results = list_notes(vault, folder)
-            import json
-            return [types.TextContent(type="text", text=json.dumps(results, indent=2))]
+            return _reply(results)
 
         elif name == "list_writable_notes":
             result = list_writable_notes(vault)
-            import json
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "append_to_note":
             note_path = arguments.get("note_path", "")
@@ -283,13 +310,11 @@ async def handle_call_tool(
                 raise ValueError("'content' argument is required")
             add_timestamp = arguments.get("add_timestamp", True)
             result = append_to_note(vault, note_path, content, add_timestamp)
-            import json
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "list_templates":
             result = list_templates(vault)
-            import json
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "create_note_from_template":
             template_name = arguments.get("template_name", "")
@@ -298,7 +323,6 @@ async def handle_call_tool(
             note_suffix = arguments.get("note_suffix") or None
             field_values = arguments.get("field_values") or None
             agent_access = arguments.get("agent_access") or None
-            import sys, json
             print(
                 f"[create_note_from_template] template={template_name!r} "
                 f"suffix={note_suffix!r} field_values={field_values!r} "
@@ -306,7 +330,7 @@ async def handle_call_tool(
                 file=sys.stderr,
             )
             result = create_note_from_template(vault, template_name, note_suffix, field_values, agent_access)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "update_note":
             note_path = arguments.get("note_path", "")
@@ -315,9 +339,8 @@ async def handle_call_tool(
                 raise ValueError("'note_path' argument is required")
             if not new_content:
                 raise ValueError("'new_content' argument is required")
-            import json
             result = update_note(vault, note_path, new_content)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "replace_in_note":
             note_path = arguments.get("note_path", "")
@@ -327,9 +350,8 @@ async def handle_call_tool(
                 raise ValueError("'note_path' argument is required")
             if not old_text:
                 raise ValueError("'old_text' argument is required")
-            import json
             result = replace_in_note(vault, note_path, old_text, new_text)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         elif name == "update_section":
             note_path = arguments.get("note_path", "")
@@ -341,17 +363,28 @@ async def handle_call_tool(
                 raise ValueError("'heading' argument is required")
             if not new_content:
                 raise ValueError("'new_content' argument is required")
-            import json
             result = update_section(vault, note_path, heading, new_content)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            return _reply(result)
 
         else:
             raise ValueError(f"Unknown tool: {name}")
 
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError, FileExistsError) as e:
         return [types.TextContent(type="text", text=f"Error: {e}")]
+    except NoteReadError as e:
+        # Structured so the caller can tell "this file is broken" apart from
+        # "this file doesn't exist". Path + parse error only — never content.
+        return _reply({"error": e.summary, "detail": e.detail, "path": e.note_path})
     except (ValueError, PermissionError, RuntimeError) as e:
         return [types.TextContent(type="text", text=f"Error: {e}")]
+    except Exception as e:
+        # Backstop: a single malformed note must never take down the tool call.
+        traceback.print_exc(file=sys.stderr)
+        return [
+            types.TextContent(
+                type="text", text=f"Error: unexpected {type(e).__name__}: {e}"
+            )
+        ]
 
 
 async def _run() -> None:

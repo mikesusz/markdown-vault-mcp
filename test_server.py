@@ -53,6 +53,16 @@ def err(msg: str) -> None:
     print(f"{RED}✗ {msg}{RESET}")
 
 
+def report_warnings(payload: dict) -> None:
+    """Print the 'warnings' array a scanning tool returns, if it has one."""
+    skipped = payload.get("warnings") if isinstance(payload, dict) else None
+    if not skipped:
+        return
+    warn(f"{len(skipped)} file(s) skipped:")
+    for entry in skipped[:5]:
+        print(f"    {entry['path']} — {entry['error']}")
+
+
 def pretty(data: str) -> None:
     try:
         parsed = json.loads(data)
@@ -69,6 +79,9 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
         args=["-m", "markdown_vault_mcp.server"],
         env={**os.environ, "VAULT_PATH": vault_path},
     )
+
+    all_note_paths: set[str] = set()
+    writable_paths: set[str] = set()
 
     print(f"{BOLD}Vault:{RESET} {vault_path}")
     print(f"{BOLD}Server:{RESET} {sys.executable} -m markdown_vault_mcp.server")
@@ -103,8 +116,11 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                 err(f"Tool returned error:\n{text}")
             else:
                 try:
-                    notes = json.loads(text)
+                    payload = json.loads(text)
+                    notes = payload["notes"]
+                    all_note_paths = {n["path"] for n in notes}
                     ok(f"Found {len(notes)} note(s)")
+                    report_warnings(payload)
                     if notes:
                         print(f"  First 3: {[n['path'] for n in notes[:3]]}")
                         if note_path is None:
@@ -125,8 +141,9 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                         err(f"Tool returned error:\n{text}")
                     else:
                         try:
-                            notes = json.loads(text)
-                            ok(f"Found {len(notes)} note(s) in '{folder}'")
+                            payload = json.loads(text)
+                            ok(f"Found {len(payload['notes'])} note(s) in '{folder}'")
+                            report_warnings(payload)
                         except json.JSONDecodeError:
                             warn(f"Response is not JSON:\n{text}")
 
@@ -173,8 +190,10 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                 err(f"Tool returned error:\n{text}")
             else:
                 try:
-                    results = json.loads(text)
+                    payload = json.loads(text)
+                    results = payload["results"]
                     ok(f"Search returned {len(results)} result(s)")
+                    report_warnings(payload)
                     for res in results[:3]:
                         print(f"  [{res['relevance_score']}] {res['path']}")
                         print(f"    {res['snippet'][:80]}")
@@ -189,8 +208,9 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                 err(f"Tool returned error:\n{text}")
             else:
                 try:
-                    results = json.loads(text)
-                    ok(f"Returned {len(results)} result(s) (expected 0)")
+                    payload = json.loads(text)
+                    ok(f"Returned {len(payload['results'])} result(s) (expected 0)")
+                    report_warnings(payload)
                 except json.JSONDecodeError:
                     warn(f"Response is not JSON:\n{text}")
 
@@ -204,10 +224,11 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                 try:
                     data = json.loads(text)
                     writable = data.get("writable_notes", [])
+                    writable_paths = {w["path"] for w in writable}
                     ok(f"Whitelist has {len(writable)} note(s)")
-                    for w in writable:
-                        status = "exists" if w["exists"] else "not yet created"
-                        print(f"  {w['path']:20s}  [{status}]  {w['purpose']}")
+                    for w in writable[:10]:
+                        print(f"  {w['path']:40s}  [{w['access_level']}]")
+                    report_warnings(data)
                 except json.JSONDecodeError:
                     warn(f"Response is not JSON:\n{text}")
 
@@ -250,17 +271,25 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                 except json.JSONDecodeError:
                     warn(f"Response is not JSON:\n{text}")
 
-            # ── append_to_note (non-whitelisted — expect error) ───────────
-            header("append_to_note  (non-whitelisted file — expect error)")
-            r = await session.call_tool(
-                "append_to_note",
-                {"note_path": "some_random_note.md", "content": "should be blocked"},
-            )
-            text = r.content[0].text if r.content else ""
-            if text.startswith("Error:"):
-                ok(f"Blocked as expected: {text}")
+            # ── append_to_note (read-only note — expect error) ────────────
+            # A note that list_notes sees but list_writable_notes doesn't is
+            # read-only, so appending to it must be refused. Notes that don't
+            # exist yet are NOT a permission error — they're created on append,
+            # which is the documented default-access behaviour.
+            header("append_to_note  (read-only note — expect error)")
+            read_only = next(iter(all_note_paths - writable_paths), None)
+            if read_only is None:
+                warn("No read-only note in this vault; skipping permission check")
             else:
-                err(f"Expected a whitelist error, got:\n{text}")
+                r = await session.call_tool(
+                    "append_to_note",
+                    {"note_path": read_only, "content": "should be blocked"},
+                )
+                text = r.content[0].text if r.content else ""
+                if text.startswith("Error:"):
+                    ok(f"Blocked as expected ({read_only}): {text}")
+                else:
+                    err(f"Expected a permission error for {read_only!r}, got:\n{text}")
 
             # ── append_to_note (path traversal — expect error) ────────────
             header("append_to_note  (path traversal attempt — expect error)")
@@ -289,6 +318,7 @@ async def run_tests(vault_path: str, note_path: str | None, query: str) -> None:
                     ok(f"Found {len(templates)} template(s): {template_names}")
                     for t in templates:
                         print(f"  {t['name']:25s}  {t['description']}")
+                    report_warnings(data)
                 except json.JSONDecodeError:
                     warn(f"Response is not JSON:\n{text}")
 

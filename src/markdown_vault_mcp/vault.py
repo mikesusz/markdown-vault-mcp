@@ -33,8 +33,84 @@ def _is_ignored(path: Path, vault_root: Path) -> bool:
     return any(part in IGNORED_DIRS for part in relative.parts)
 
 
+def _warn(message: str) -> None:
+    """Log to stderr so it doesn't interfere with the stdio MCP transport."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    print(f"[{ts}] warning: {message}", file=sys.stderr)
+
+
 def _format_modified(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+
+
+class NoteReadError(Exception):
+    """A note could not be read, or its frontmatter could not be parsed.
+
+    Carries the vault-relative path and a short, user-facing detail string.
+    Never carries any of the note's own content: a note may be unparseable and
+    still have meant to be hidden, so only the path and the parse error are
+    ever surfaced.
+    """
+
+    def __init__(self, note_path: str, detail: str, summary: str) -> None:
+        self.note_path = note_path
+        self.detail = detail
+        self.summary = summary
+        super().__init__(f"{summary} ('{note_path}'): {detail}")
+
+
+def _parse_error_detail(exc: Exception) -> str:
+    """Short, single-line description of a frontmatter parse failure."""
+    problem = getattr(exc, "problem", None)
+    mark = getattr(exc, "problem_mark", None)
+    if problem:
+        # PyYAML marks are 0-indexed and line up with the file's own lines,
+        # since the frontmatter block starts at the top of the file.
+        where = f" (line {mark.line + 1})" if mark is not None else ""
+        return f"YAML parse error: {problem}{where}"
+    first_line = str(exc).splitlines()[0] if str(exc) else ""
+    return f"YAML parse error: {first_line or type(exc).__name__}"
+
+
+def _load_post(full_path: Path, note_path: str) -> frontmatter.Post:
+    """Parse a note into a frontmatter Post.
+
+    Raises NoteReadError if the file can't be read or its frontmatter can't be
+    parsed, so vault-wide scans can skip a single bad file — and report it —
+    instead of failing everywhere. Empty and whitespace-only files are valid:
+    they parse to a post with no frontmatter and no content.
+    """
+    try:
+        text = full_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise NoteReadError(
+            note_path,
+            f"Unreadable file: {exc.strerror or exc}",
+            "Could not read this note",
+        ) from exc
+
+    # A UTF-8 BOM before the opening '---' hides the frontmatter block from the
+    # parser, which would silently downgrade a 'hidden' note to the default.
+    text = text.lstrip("﻿")
+
+    if not text.strip():
+        return frontmatter.Post("")
+
+    try:
+        return frontmatter.loads(text)
+    except Exception as exc:  # malformed YAML, unsupported tags, etc.
+        raise NoteReadError(
+            note_path,
+            _parse_error_detail(exc),
+            "Could not parse this note's frontmatter",
+        ) from exc
+
+
+def _read_note(full_path: Path, note_path: str) -> tuple[dict, str]:
+    """Read a note's frontmatter + body. Raises NoteReadError if unparseable."""
+    post = _load_post(full_path, note_path)
+    metadata = post.metadata if isinstance(post.metadata, dict) else {}
+    return metadata, post.content
 
 
 def _note_title(path: Path) -> str:
@@ -68,7 +144,43 @@ class SearchResult(TypedDict):
     relevance_score: float
 
 
-def list_notes(vault_path: str, folder: str | None = None) -> list[NoteInfo]:
+class SkippedFile(TypedDict):
+    """A file a scan couldn't read. Path and error only — never any content."""
+    path: str
+    error: str
+
+
+class _WithWarnings(TypedDict, total=False):
+    """Mixin: 'warnings' is present only when files were actually skipped."""
+    warnings: list[SkippedFile]
+
+
+class ListNotesResult(_WithWarnings):
+    notes: list[NoteInfo]
+
+
+class SearchNotesResult(_WithWarnings):
+    results: list[SearchResult]
+
+
+class SkipCollector:
+    """Collects files skipped during a scan, logging each one to stderr."""
+
+    def __init__(self) -> None:
+        self.skipped: list[SkippedFile] = []
+
+    def record(self, exc: NoteReadError) -> None:
+        _warn(f"skipping {exc.note_path!r}: {exc.detail}")
+        self.skipped.append(SkippedFile(path=exc.note_path, error=exc.detail))
+
+    def attach(self, payload: dict) -> dict:
+        """Add 'warnings' to a result, omitting the key entirely when empty."""
+        if self.skipped:
+            payload["warnings"] = self.skipped
+        return payload
+
+
+def list_notes(vault_path: str, folder: str | None = None) -> ListNotesResult:
     """List all .md notes in the vault, optionally filtered by subfolder."""
     root = _resolve_vault(vault_path)
     search_root = root
@@ -81,21 +193,44 @@ def list_notes(vault_path: str, folder: str | None = None) -> list[NoteInfo]:
             raise ValueError("Folder path escapes vault root")
 
     notes: list[NoteInfo] = []
+    skips = SkipCollector()
+
     for md_file in sorted(search_root.rglob("*.md")):
         if _is_ignored(md_file, root):
             continue
-        if not _is_agent_visible(md_file):
+
+        relative = _relative_str(md_file, root)
+        try:
+            metadata, _ = _read_note(md_file, relative)
+            stat = md_file.stat()  # can fail on a broken symlink
+        except NoteReadError as exc:
+            skips.record(exc)
             continue
-        stat = md_file.stat()
+        except OSError as exc:
+            skips.record(
+                NoteReadError(
+                    relative,
+                    f"Unreadable file: {exc.strerror or exc}",
+                    "Could not read this note",
+                )
+            )
+            continue
+
+        # Hidden notes are excluded silently — that's a deliberate setting,
+        # not a problem the user needs to be told about.
+        if _access_of(metadata) == "hidden":
+            continue
+
         notes.append(
             NoteInfo(
                 title=_note_title(md_file),
-                path=_relative_str(md_file, root),
+                path=relative,
                 size=stat.st_size,
                 modified=_format_modified(md_file),
             )
         )
-    return notes
+
+    return skips.attach(ListNotesResult(notes=notes))
 
 
 def get_note(vault_path: str, note_path: str) -> NoteContent:
@@ -113,17 +248,18 @@ def get_note(vault_path: str, note_path: str) -> NoteContent:
         raise ValueError(f"Not a markdown file: {note_path}")
     if _is_ignored(full_path, root):
         raise PermissionError(f"Note is in an ignored directory: {note_path}")
-    if not _is_agent_visible(full_path):
+
+    metadata, content = _read_note(full_path, _relative_str(full_path, root))
+    if _access_of(metadata) == "hidden":
         raise PermissionError(f"Note '{note_path}' is not accessible to agents")
 
-    post = frontmatter.load(str(full_path))
     stat = full_path.stat()
 
     return NoteContent(
         title=_note_title(full_path),
         path=_relative_str(full_path, root),
-        content=post.content,
-        frontmatter=dict(post.metadata),
+        content=content,
+        frontmatter=metadata,
         modified=_format_modified(full_path),
         size=stat.st_size,
     )
@@ -154,11 +290,12 @@ def _score(title: str, content: str, query: str) -> float:
     return title_hits * 5.0 + content_hits * 1.0
 
 
-def search_notes(vault_path: str, query: str, limit: int = 10) -> list[SearchResult]:
+def search_notes(vault_path: str, query: str, limit: int = 10) -> SearchNotesResult:
     """Search notes by filename and content (case-insensitive), return top results."""
     root = _resolve_vault(vault_path)
     query_lower = query.lower()
     results: list[SearchResult] = []
+    skips = SkipCollector()
 
     for md_file in root.rglob("*.md"):
         if _is_ignored(md_file, root):
@@ -166,14 +303,13 @@ def search_notes(vault_path: str, query: str, limit: int = 10) -> list[SearchRes
 
         title = _note_title(md_file)
         try:
-            raw_text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            metadata, content = _read_note(md_file, _relative_str(md_file, root))
+        except NoteReadError as exc:
+            skips.record(exc)
             continue
 
-        post = frontmatter.loads(raw_text)
-        if _normalize_access(post.metadata.get("agent_access", "append")) == "hidden":
+        if _access_of(metadata) == "hidden":
             continue
-        content = post.content
 
         title_match = query_lower in title.lower()
         content_match = query_lower in content.lower()
@@ -195,7 +331,7 @@ def search_notes(vault_path: str, query: str, limit: int = 10) -> list[SearchRes
         )
 
     results.sort(key=lambda r: r["relevance_score"], reverse=True)
-    return results[:limit]
+    return skips.attach(SearchNotesResult(results=results[:limit]))
 
 
 # ── write operations ──────────────────────────────────────────────────────────
@@ -212,31 +348,34 @@ class AppendResult(TypedDict):
     message: str
 
 
-def list_writable_notes(vault_path: str) -> dict[str, list[WritableNoteInfo]]:
+class WritableNotesResult(_WithWarnings):
+    writable_notes: list[WritableNoteInfo]
+
+
+def list_writable_notes(vault_path: str) -> WritableNotesResult:
     """Return all notes that agents can append to (agent_access: append or edit, or no frontmatter)."""
     root = _resolve_vault(vault_path)
     notes: list[WritableNoteInfo] = []
+    skips = SkipCollector()
 
     for md_file in sorted(root.rglob("*.md")):
         if _is_ignored(md_file, root):
             continue
+
+        relative = _relative_str(md_file, root)
         try:
-            post = frontmatter.loads(md_file.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
+            metadata, _ = _read_note(md_file, relative)
+        except NoteReadError as exc:
+            skips.record(exc)
             continue
 
-        access = _normalize_access(post.metadata.get("agent_access", "append"))
+        access = _access_of(metadata)
         if access not in ("append", "edit"):
             continue
 
-        notes.append(
-            WritableNoteInfo(
-                path=_relative_str(md_file, root),
-                access_level=access,
-            )
-        )
+        notes.append(WritableNoteInfo(path=relative, access_level=access))
 
-    return {"writable_notes": notes}
+    return skips.attach(WritableNotesResult(writable_notes=notes))
 
 
 def append_to_note(
@@ -257,7 +396,9 @@ def append_to_note(
     # If the file exists, verify frontmatter permission.
     # If it doesn't exist yet, default access is 'append' — allow creation.
     if full_path.exists():
-        allowed, current = _check_agent_access(full_path, "append")
+        allowed, current = _check_agent_access(
+            _load_post(full_path, note_path), "append"
+        )
         if not allowed:
             raise PermissionError(
                 f"Insufficient permissions. This note has agent_access: '{current}', "
@@ -329,6 +470,10 @@ class EditNoteResult(TypedDict):
     message: str
 
 
+class TemplatesResult(_WithWarnings):
+    templates: list[TemplateInfo]
+
+
 def _replace_placeholders(content: str) -> str:
     """Replace {{PLACEHOLDER}} tokens with current date/time values."""
     now = datetime.now()
@@ -381,27 +526,46 @@ def _templates_dir(root: Path) -> Path:
     return td
 
 
-def list_templates(vault_path: str) -> dict[str, list[TemplateInfo]]:
+def list_templates(vault_path: str) -> TemplatesResult:
     """List all .md files in the vault's templates/ directory."""
     root = _resolve_vault(vault_path)
     td = _templates_dir(root)
 
     templates: list[TemplateInfo] = []
+    skips = SkipCollector()
+
     for md_file in sorted(td.glob("*.md")):
+        relative = _relative_str(md_file, root)
         try:
+            # Parse up front: a template whose frontmatter is unparseable can't
+            # be used by create_note_from_template, so listing it as available
+            # would just set up a later failure.
+            _load_post(md_file, relative)
             content = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            content = ""
-        stat = md_file.stat()
+            stat = md_file.stat()
+        except NoteReadError as exc:
+            skips.record(exc)
+            continue
+        except OSError as exc:
+            skips.record(
+                NoteReadError(
+                    relative,
+                    f"Unreadable file: {exc.strerror or exc}",
+                    "Could not read this template",
+                )
+            )
+            continue
+
         templates.append(
             TemplateInfo(
                 name=md_file.stem,
-                path=_relative_str(md_file, root),
+                path=relative,
                 size=stat.st_size,
                 description=_extract_template_description(content),
             )
         )
-    return {"templates": templates}
+
+    return skips.attach(TemplatesResult(templates=templates))
 
 
 def _resolve_note_path(vault_path: str, note_path: str) -> tuple[Path, Path]:
@@ -425,25 +589,30 @@ _LEGACY_ACCESS_MAP = {"full": "edit", "none": "read"}
 _ACCESS_LEVELS = {"hidden": 0, "read": 1, "append": 2, "edit": 3}
 
 
-def _normalize_access(raw: str) -> str:
-    """Map legacy values and return normalized agent_access string."""
+def _normalize_access(raw: object) -> str:
+    """Map legacy values and return normalized agent_access string.
+
+    YAML happily produces non-strings here (`agent_access: [append]`,
+    `agent_access: true`, a bare `agent_access:`). Anything that isn't a known
+    string is stringified rather than raising, so it resolves to an unknown
+    level: visible, but not writable.
+    """
+    if raw is None:
+        return "append"  # key present but blank — same as no key at all
+    if not isinstance(raw, str):
+        return str(raw)
     return _LEGACY_ACCESS_MAP.get(raw, raw)
 
 
-def _is_agent_visible(full_path: Path) -> bool:
-    """Return False if note has agent_access: hidden (invisible to agents)."""
-    try:
-        post = frontmatter.loads(full_path.read_text(encoding="utf-8", errors="replace"))
-    except OSError:
-        return True
-    access = _normalize_access(post.metadata.get("agent_access", "append"))
-    return access != "hidden"
+def _access_of(metadata: dict) -> str:
+    """Normalized agent_access level for a note's frontmatter."""
+    return _normalize_access(metadata.get("agent_access", "append"))
 
 
-def _check_agent_access(full_path: Path, required: str) -> tuple[bool, str]:
+def _check_agent_access(post: frontmatter.Post, required: str) -> tuple[bool, str]:
     """Check agent_access frontmatter permission. Returns (allowed, current_access)."""
-    post = frontmatter.loads(full_path.read_text(encoding="utf-8"))
-    current = _normalize_access(post.metadata.get("agent_access", "append"))
+    metadata = post.metadata if isinstance(post.metadata, dict) else {}
+    current = _access_of(metadata)
     required_num = _ACCESS_LEVELS.get(required, 0)
     current_num = _ACCESS_LEVELS.get(current, -1)
     return current_num >= required_num, current
@@ -452,7 +621,8 @@ def _check_agent_access(full_path: Path, required: str) -> tuple[bool, str]:
 def update_note(vault_path: str, note_path: str, new_content: str) -> EditNoteResult:
     """Replace the body of a note, preserving its frontmatter. Requires agent_access: edit."""
     root, full_path = _resolve_note_path(vault_path, note_path)
-    allowed, current = _check_agent_access(full_path, "edit")
+    post = _load_post(full_path, note_path)
+    allowed, current = _check_agent_access(post, "edit")
     if not allowed:
         raise PermissionError(
             f"Insufficient permissions. This note has agent_access: '{current}', "
@@ -460,7 +630,6 @@ def update_note(vault_path: str, note_path: str, new_content: str) -> EditNoteRe
             "Add agent_access: 'edit' to the note's frontmatter to enable this operation."
         )
 
-    post = frontmatter.loads(full_path.read_text(encoding="utf-8"))
     post.content = new_content
     full_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
@@ -479,7 +648,8 @@ def replace_in_note(
 ) -> EditNoteResult:
     """Find and replace text in a note body. Requires agent_access: edit."""
     root, full_path = _resolve_note_path(vault_path, note_path)
-    allowed, current = _check_agent_access(full_path, "edit")
+    post = _load_post(full_path, note_path)
+    allowed, current = _check_agent_access(post, "edit")
     if not allowed:
         raise PermissionError(
             f"Insufficient permissions. This note has agent_access: '{current}', "
@@ -487,7 +657,6 @@ def replace_in_note(
             "Add agent_access: 'edit' to the note's frontmatter to enable this operation."
         )
 
-    post = frontmatter.loads(full_path.read_text(encoding="utf-8"))
     if old_text not in post.content:
         raise ValueError(f"Text not found in note: {old_text!r}")
 
@@ -509,7 +678,8 @@ def update_section(
 ) -> EditNoteResult:
     """Replace the content under a heading (preserves the heading). Requires agent_access: edit."""
     root, full_path = _resolve_note_path(vault_path, note_path)
-    allowed, current = _check_agent_access(full_path, "edit")
+    post = _load_post(full_path, note_path)
+    allowed, current = _check_agent_access(post, "edit")
     if not allowed:
         raise PermissionError(
             f"Insufficient permissions. This note has agent_access: '{current}', "
@@ -517,7 +687,6 @@ def update_section(
             "Add agent_access: 'edit' to the note's frontmatter to enable this operation."
         )
 
-    post = frontmatter.loads(full_path.read_text(encoding="utf-8"))
     body = post.content
 
     # Find the heading line (exact match on the full line after stripping)
@@ -600,6 +769,12 @@ def create_note_from_template(
     #   - Keys with no frontmatter match → fall back to # KEY: heading replacement in body
     # Placeholders ({{TODAY}} etc.) are expanded after all field substitution so they
     # are also resolved inside any freshly-written frontmatter values.
+    try:
+        _load_post(template_path, _relative_str(template_path, root))
+    except NoteReadError as exc:
+        raise NoteReadError(
+            exc.note_path, exc.detail, "Could not parse this template's frontmatter"
+        ) from exc
     raw = template_path.read_text(encoding="utf-8")
 
     applied: dict[str, str] = {}

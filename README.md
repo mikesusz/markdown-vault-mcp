@@ -114,15 +114,19 @@ Search markdown notes by title or content (case-insensitive). Returns up to 10 r
 **Example result:**
 
 ```json
-[
-	{
-		"title": "Meeting Notes",
-		"path": "work/Meeting Notes.md",
-		"snippet": "…discussed the new project architecture…",
-		"relevance_score": 7.0
-	}
-]
+{
+	"results": [
+		{
+			"title": "Meeting Notes",
+			"path": "work/Meeting Notes.md",
+			"snippet": "…discussed the new project architecture…",
+			"relevance_score": 7.0
+		}
+	]
+}
 ```
+
+Plus a [`warnings`](#skipped-files) array if any files had to be skipped.
 
 ---
 
@@ -147,6 +151,16 @@ Retrieve the full content and metadata of a specific note.
 }
 ```
 
+If the note's frontmatter can't be parsed, `get_note` returns a structured error naming the problem instead of the note:
+
+```json
+{
+	"error": "Could not parse this note's frontmatter",
+	"detail": "YAML parse error: mapping values are not allowed in this context (line 3)",
+	"path": "Reference - House.md"
+}
+```
+
 ---
 
 ### `list_notes`
@@ -160,16 +174,20 @@ List all markdown notes in the vault (or a subfolder).
 **Example result:**
 
 ```json
-[
-	{ "title": "Home", "path": "Home.md", "size": 512, "modified": "2024-06-01T09:00:00" },
-	{
-		"title": "Daily Note",
-		"path": "Daily/2024-01-15.md",
-		"size": 256,
-		"modified": "2024-01-15T08:00:00"
-	}
-]
+{
+	"notes": [
+		{ "title": "Home", "path": "Home.md", "size": 512, "modified": "2024-06-01T09:00:00" },
+		{
+			"title": "Daily Note",
+			"path": "Daily/2024-01-15.md",
+			"size": 256,
+			"modified": "2024-01-15T08:00:00"
+		}
+	]
+}
 ```
+
+Plus a [`warnings`](#skipped-files) array if any files had to be skipped.
 
 ---
 
@@ -189,6 +207,8 @@ Show all notes that agents can append to — those with `agent_access: append` o
 	]
 }
 ```
+
+Plus a [`warnings`](#skipped-files) array if any files had to be skipped.
 
 ---
 
@@ -247,6 +267,38 @@ List all `.md` files in your vault's `templates/` directory.
 	]
 }
 ```
+
+Plus a [`warnings`](#skipped-files) array if any files had to be skipped.
+
+---
+
+### Skipped files
+
+Every vault-scanning tool — `list_notes`, `search_notes`, `list_writable_notes`,
+and `list_templates` — skips any file it can't read rather than failing the whole
+scan. When that happens, it reports the skipped files alongside the normal
+results:
+
+```json
+{
+	"notes": [ "…normal results, unchanged…" ],
+	"warnings": [
+		{
+			"path": "Reference - House.md",
+			"error": "YAML parse error: mapping values are not allowed in this context (line 3)"
+		}
+	]
+}
+```
+
+- The `warnings` key is **absent entirely** when nothing was skipped — it never
+  appears as an empty array.
+- Each entry carries only the path and the parse error. A note's title, content,
+  frontmatter, and access level are never included, since an unparseable note may
+  well have been meant to stay hidden.
+- Skipped files are also logged to stderr, visible in your MCP client's logs.
+- Hidden notes (`agent_access: hidden`) are excluded silently and never appear
+  in `warnings` — that's a deliberate setting, not a problem to report.
 
 ---
 
@@ -436,6 +488,14 @@ Options:
 - `--note` — specific note path to test `get_note` with
 - `--query` — search term for `search_notes` (default: `"the"`)
 
+Run the robustness suite, which builds a throwaway vault full of empty and
+malformed notes and asserts that no single bad file breaks vault-wide
+operations (no real vault needed):
+
+```bash
+python test_vault_robustness.py
+```
+
 ---
 
 ## Troubleshooting
@@ -448,6 +508,24 @@ Create a `templates/` folder in your vault root, or copy templates from `templat
 
 **`Insufficient permissions`**
 The note has `agent_access: read` or `hidden`. Add `agent_access: append` or `agent_access: edit` to its frontmatter.
+
+**A note is missing from `list_notes` or `search_notes`**
+A note whose YAML frontmatter can't be parsed is skipped rather than exposed,
+so one bad file never breaks results for the rest of the vault. The response
+names it in a [`warnings`](#skipped-files) array (and the server logs it to
+stderr) — fix the `---` block at the top of that file and it reappears.
+`get_note` on the same file returns an explicit error naming the problem.
+If a note is missing with no warning, check whether it's `agent_access: hidden`.
+
+**Empty (0-byte) `.md` files**
+Handled normally — treated as a note with no frontmatter and no content, which
+means the default `agent_access: append`. They appear in `list_notes` and
+`list_writable_notes`, never match a search, and don't affect other notes.
+
+**Frontmatter with a non-string `agent_access`**
+Values like `agent_access: [append]` or `agent_access: true` resolve to an
+unknown level: the note stays visible but is not writable. Quote the value or
+use one of `hidden` / `read` / `append` / `edit`.
 
 **Changes to server code aren't taking effect**
 Your MCP client keeps the server process alive. Restart the client (e.g. quit and relaunch Claude Desktop) to pick up code changes.
